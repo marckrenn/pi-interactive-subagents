@@ -1,7 +1,6 @@
-import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
-import type { TUI, Component } from "@mariozechner/pi-tui";
+import { Text } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -10,7 +9,6 @@ import {
   createSurface,
   sendCommand,
   pollForExit,
-  readScreen,
   closeSurface,
   shellEscape,
   exitStatusVar,
@@ -156,98 +154,6 @@ function measureSessionProgress(
   }
 }
 
-interface SubagentOverlayState {
-  name: string;
-  interactive: boolean;
-  startTime: number;
-  phase: "preparing" | "writing" | "starting" | "loading" | "running" | "done" | "error";
-  artifactName: string;
-  artifactPath: string;
-  writtenBytes: number;
-  totalBytes: number;
-  sessionEntries: number;
-  sessionBytes: number;
-  previewText: string;
-  screenText: string;
-}
-
-const OVERLAY_PREVIEW_LINES = 18;
-let subagentOverlayActive = false;
-
-class SubagentPanel implements Component {
-  constructor(
-    private state: SubagentOverlayState,
-    private theme: Theme,
-  ) {}
-
-  render(width: number): string[] {
-    const th = this.theme;
-    const innerW = width - 4;
-    if (innerW < 10) return [];
-
-    const lines: string[] = [];
-    const pad = (content: string) => {
-      const vis = visibleWidth(content);
-      const padding = Math.max(0, innerW - vis);
-      return th.fg("border", "│") + " " + content + " ".repeat(padding) + " " + th.fg("border", "│");
-    };
-
-    const elapsed = formatElapsed(Math.floor((Date.now() - this.state.startTime) / 1000));
-    const title = ` Subagent ${elapsed} `;
-    const titleStyled = th.fg("accent", title);
-    const borderRemaining = Math.max(0, innerW - title.length);
-    const left = Math.floor(borderRemaining / 2);
-    const right = borderRemaining - left;
-    lines.push(th.fg("border", "╭" + "─".repeat(left)) + titleStyled + th.fg("border", "─".repeat(right) + "╮"));
-
-    const phaseLabel =
-      this.state.phase === "preparing" ? "preparing context"
-      : this.state.phase === "writing" ? "writing artifact"
-      : this.state.phase === "starting" ? "starting session"
-      : this.state.phase === "loading" ? "loading agent"
-      : this.state.phase === "running" ? "running"
-      : this.state.phase === "done" ? "completed"
-      : "error";
-    const phaseColor =
-      this.state.phase === "done" ? "success"
-      : this.state.phase === "error" ? "error"
-      : this.state.phase === "running" ? "accent"
-      : "warning";
-    let status = th.fg(phaseColor as any, "● ") + th.fg("muted", `${this.state.name} · ${phaseLabel}`);
-    if (this.state.phase === "writing" || this.state.phase === "preparing") {
-      status += th.fg("dim", ` · ${formatBytes(this.state.writtenBytes)} / ${formatBytes(this.state.totalBytes)}`);
-    } else if (this.state.sessionEntries > 0 || this.state.sessionBytes > 0) {
-      status += th.fg("dim", ` · ${this.state.sessionEntries} messages · ${formatBytes(this.state.sessionBytes)}`);
-    }
-    lines.push(pad(status));
-
-    for (const line of wrapTextWithAnsi(th.fg("dim", `artifact: ${this.state.artifactName}`), innerW)) {
-      lines.push(pad(line));
-    }
-
-    lines.push(th.fg("border", "├" + "─".repeat(innerW + 2) + "┤"));
-
-    const body = this.state.phase === "running" || this.state.phase === "loading"
-      ? (this.state.screenText || this.state.previewText || "Waiting for output…")
-      : (this.state.previewText || "Preparing context…");
-
-    const wrapped: string[] = [];
-    for (const rawLine of body.split("\n")) {
-      if (rawLine === "") wrapped.push("");
-      else wrapped.push(...wrapTextWithAnsi(rawLine, innerW));
-    }
-    const display = wrapped.slice(-OVERLAY_PREVIEW_LINES);
-    for (const line of display) {
-      lines.push(pad(truncateToWidth(line, innerW)));
-    }
-
-    lines.push(th.fg("border", "╰" + "─".repeat(innerW + 2) + "╯"));
-    return lines;
-  }
-
-  invalidate(): void {}
-}
-
 export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
@@ -296,15 +202,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       let surface: string | null = null;
-
-      const showOverlay = ctx.hasUI && !subagentOverlayActive;
-      let overlayTui: TUI | null = null;
-      let overlayCloseFn: (() => void) | null = null;
-      let overlayPromise: Promise<void> | null = null;
-      let overlayState: SubagentOverlayState | null = null;
-      const updateOverlay = () => {
-        overlayTui?.requestRender();
-      };
 
       try {
 
@@ -397,73 +294,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         const artifactName = `context/${params.name.toLowerCase().replace(/\s+/g, "-")}-${timestamp}.md`;
         const artifactPath = join(artifactDir, artifactName);
-
-        if (showOverlay) {
-          overlayState = {
-            name: params.name,
-            interactive,
-            startTime,
-            phase: "preparing",
-            artifactName,
-            artifactPath,
-            writtenBytes: 0,
-            totalBytes: contextBytes,
-            sessionEntries: 0,
-            sessionBytes: 0,
-            previewText: "",
-            screenText: "",
-          };
-          subagentOverlayActive = true;
-          overlayPromise = ctx.ui.custom<void>(
-            (tui, theme, _kb, done) => {
-              overlayTui = tui;
-              overlayCloseFn = () => done();
-              return new SubagentPanel(overlayState!, theme);
-            },
-            {
-              overlay: true,
-              overlayOptions: {
-                nonCapturing: true,
-                anchor: "right-center",
-                width: "50%",
-                minWidth: 40,
-                maxHeight: "90%",
-                margin: { right: 1, top: 1, bottom: 1 },
-                visible: (termWidth) => termWidth >= 100,
-              },
-            },
-          );
-        }
-
-        // Stream the already-built context into the overlay so the user sees
-        // it being prepared before the sub-agent starts. This is a UI preview,
-        // not slow disk I/O.
-        if (overlayState) {
-          overlayState.phase = "writing";
-          const chunks = Math.max(1, Math.min(12, Math.ceil(contextBytes / 2048)));
-          const step = Math.max(1, Math.ceil(fullTask.length / chunks));
-          for (let i = step; i < fullTask.length; i += step) {
-            overlayState.previewText = fullTask.slice(0, i);
-            overlayState.writtenBytes = Buffer.byteLength(overlayState.previewText, "utf8");
-            updateOverlay();
-            await new Promise<void>((resolve) => setTimeout(resolve, 12));
-          }
-          overlayState.previewText = fullTask;
-          overlayState.writtenBytes = contextBytes;
-          updateOverlay();
-        }
-
         mkdirSync(dirname(artifactPath), { recursive: true });
         writeFileSync(artifactPath, fullTask, "utf8");
         parts.push(`@${artifactPath}`);
 
         const piCommand = parts.join(" ");
         const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-
-        if (overlayState) {
-          overlayState.phase = "starting";
-          updateOverlay();
-        }
 
         // Send to surface
         sendCommand(surface, command);
@@ -496,20 +332,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           onTick() {
             const elapsed = formatElapsed(Math.floor((Date.now() - startTime) / 1000));
             const progress = measureSessionProgress(sessionDir, existingSessionFiles, forkedSessionFile);
-            const screen = surface ? readScreen(surface, 20) : "";
-
-            if (overlayState) {
-              overlayState.screenText = screen;
-            }
 
             if (progress) {
               sessionDetected = true;
-              if (overlayState) {
-                overlayState.phase = "running";
-                overlayState.sessionEntries = progress.entries;
-                overlayState.sessionBytes = progress.bytes;
-                updateOverlay();
-              }
               onUpdate?.({
                 content: [{ type: "text", text: `${elapsed} elapsed` }],
                 details: {
@@ -523,10 +348,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 },
               });
             } else {
-              if (overlayState) {
-                overlayState.phase = "loading";
-                updateOverlay();
-              }
               onUpdate?.({
                 content: [{ type: "text", text: `${elapsed} elapsed` }],
                 details: {
@@ -577,16 +398,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         closeSurface(surface);
         surface = null;
 
-        if (overlayState) {
-          overlayState.phase = exitCode === 0 ? "done" : "error";
-          updateOverlay();
-        }
-        if (showOverlay) {
-          overlayCloseFn?.();
-          if (overlayPromise) await overlayPromise;
-          subagentOverlayActive = false;
-        }
-
         const sessionRef = subSessionFile
           ? `\n\nSession: ${subSessionFile.path}\nResume: pi --session ${subSessionFile.path}`
           : "";
@@ -613,16 +424,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             // ignore cleanup errors
           }
           surface = null;
-        }
-
-        if (overlayState) {
-          overlayState.phase = signal?.aborted ? "error" : "error";
-          updateOverlay();
-        }
-        if (showOverlay) {
-          overlayCloseFn?.();
-          if (overlayPromise) await overlayPromise;
-          subagentOverlayActive = false;
         }
 
         if (signal?.aborted) {
