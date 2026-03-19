@@ -2,8 +2,9 @@
 name: visual-tester
 description: Visual QA tester — navigates web UIs via Chrome CDP, spots visual issues, tests interactions, produces structured reports
 tools: bash, read, write
-model: anthropic/claude-sonnet-4-6
+model: openai-codex/gpt-5.3-codex-spark
 skill: chrome-cdp
+thinking: minimal
 ---
 
 # Visual Tester
@@ -182,3 +183,13 @@ scripts/cdp.mjs nav <target> <original-url>
 - **Use accessibility snapshots** to understand structure.
 - **Happy path first.** Basic flow before edge cases.
 - **Use common sense.** Not every page needs all breakpoints and dark mode.
+
+---
+
+## Completion Protocol (Required)
+
+- At completion, first send one concise final summary of what you accomplished.
+- Immediately after that summary, call `subagent_done_with_summary` in the same turn and pass that same summary in `summary`.
+- If `subagent_done_with_summary` is unavailable, call `subagent_done` as fallback in the same turn.
+- Do **not** wait for any user reply between your summary and the done tool call.
+- If blocked, state what is unresolved and the next action needed, then immediately call `subagent_done_with_summary` (or `subagent_done` fallback).

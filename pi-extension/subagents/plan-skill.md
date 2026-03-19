@@ -114,7 +114,15 @@ Review with the user:
 
 ## Phase 4: Execute Todos
 
-Spawn a scout first for context, then workers sequentially:
+Spawn a scout first for context, then execute tracks with as much safe parallelism as the plan allows.
+
+### Parallelization Clause (Required)
+
+- **Spawn as many sub-agents as needed** to parallelize independent work.
+- Use `parallel_subagents` when tasks are independent (different tracks/files, no dependency edge).
+- If tasks touch the same files or require ordered commits in one checkout, run those tasks sequentially.
+- For parallel implementation tracks that need independent commits, prefer separate **git worktrees** (one per worker/track).
+- Keep dependency order from the plan/todos explicit (`blocked-by` tasks wait for prerequisites).
 
 ```typescript
 // 1. Scout gathers context
@@ -125,24 +133,34 @@ subagent({
   task: "Gather context for implementing [feature]. Read the plan at [plan path]. Identify all files that will be created/modified, map existing patterns and conventions."
 })
 
-// 2. Workers execute todos sequentially — one at a time
-subagent({
-  name: "Worker",
-  agent: "worker",
-  interactive: false,
-  task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
+// 2a. Parallel execution for independent tracks
+parallel_subagents({
+  agents: [
+    {
+      name: "Worker A",
+      agent: "worker",
+      task: "Implement TODO-xxxx. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
+    },
+    {
+      name: "Worker B",
+      agent: "worker",
+      task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
+    }
+  ]
 })
 
-// Check result, then next todo
+// 2b. Sequential execution for dependent/conflicting tasks
 subagent({
   name: "Worker",
   agent: "worker",
   interactive: false,
-  task: "Implement TODO-yyyy. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
+  task: "Implement TODO-zzzz. Mark the todo as done. Plan: [plan path]\n\nScout context: [paste scout summary]"
 })
 ```
 
-**Always run workers sequentially in the same git repo** — parallel workers will conflict on commits.
+When using worktrees, prepare them in the main session before spawning workers (one branch/worktree per parallel track), and include the assigned worktree path in each worker task.
+
+Default to sequential in one git checkout when unsure. Parallelize aggressively only where dependencies/file overlap make it safe.
 
 ---
 

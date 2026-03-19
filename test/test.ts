@@ -9,6 +9,7 @@ import {
   getEntryCount,
   getNewEntries,
   findLastAssistantMessage,
+  findLastToolResultDetailText,
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
@@ -70,6 +71,19 @@ const TOOL_RESULT = {
     toolCallId: "tc-001",
     toolName: "bash",
     content: [{ type: "text", text: "output here" }],
+  },
+};
+
+const DONE_WITH_SUMMARY_TOOL_RESULT = {
+  type: "message",
+  id: "tool-002",
+  parentId: "asst-002",
+  message: {
+    role: "toolResult",
+    toolCallId: "tc-002",
+    toolName: "subagent_done_with_summary",
+    details: { summary: "Structured final summary" },
+    content: [{ type: "text", text: "Shutting down subagent session." }],
   },
 };
 
@@ -154,6 +168,35 @@ describe("session.ts", () => {
 
     it("returns null for empty array", () => {
       assert.equal(findLastAssistantMessage([]), null);
+    });
+  });
+
+  describe("findLastToolResultDetailText", () => {
+    it("finds summary from latest matching tool result", () => {
+      const entries = [
+        TOOL_RESULT,
+        DONE_WITH_SUMMARY_TOOL_RESULT,
+      ] as any[];
+      const text = findLastToolResultDetailText(entries, "subagent_done_with_summary", "summary");
+      assert.equal(text, "Structured final summary");
+    });
+
+    it("returns null when tool result exists but summary detail is missing", () => {
+      const entries = [
+        {
+          ...DONE_WITH_SUMMARY_TOOL_RESULT,
+          message: {
+            ...DONE_WITH_SUMMARY_TOOL_RESULT.message,
+            details: {},
+          },
+        },
+      ] as any[];
+      assert.equal(findLastToolResultDetailText(entries, "subagent_done_with_summary", "summary"), null);
+    });
+
+    it("returns null when tool name does not match", () => {
+      const entries = [DONE_WITH_SUMMARY_TOOL_RESULT] as any[];
+      assert.equal(findLastToolResultDetailText(entries, "subagent_done", "summary"), null);
     });
   });
 

@@ -2,8 +2,8 @@
 name: reviewer
 description: Code review agent - reviews changes for quality, security, and correctness
 tools: read, bash
-model: anthropic/claude-opus-4-6
-thinking: medium
+model: openai-codex/gpt-5.3-codex
+thinking: high
 ---
 
 # Reviewer Agent
@@ -142,3 +142,13 @@ The bar for flagging is HIGH. Ask: "Will this actually cause a real problem?"
 ### Output
 
 If the code works and is readable, a short review with few findings is the RIGHT answer. Don't manufacture findings.
+
+---
+
+## Completion Protocol (Required)
+
+- At completion, first send one concise final summary of what you accomplished.
+- Immediately after that summary, call `subagent_done_with_summary` in the same turn and pass that same summary in `summary`.
+- If `subagent_done_with_summary` is unavailable, call `subagent_done` as fallback in the same turn.
+- Do **not** wait for any user reply between your summary and the done tool call.
+- If blocked, state what is unresolved and the next action needed, then immediately call `subagent_done_with_summary` (or `subagent_done` fallback).

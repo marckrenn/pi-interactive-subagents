@@ -3,8 +3,9 @@ import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -21,7 +22,13 @@ import {
 import {
   getNewEntries,
   findLastAssistantMessage,
+  findLastToolResultDetailText,
 } from "./session.ts";
+
+const EXTENSION_DIR = realpathSync(dirname(fileURLToPath(import.meta.url)));
+const PACKAGE_AGENTS_DIR = join(EXTENSION_DIR, "../../agents");
+const SUBAGENT_DONE_EXTENSION_PATH = join(EXTENSION_DIR, "subagent-done.ts");
+const PLAN_SKILL_PATH = join(EXTENSION_DIR, "plan-skill.md");
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -53,7 +60,7 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const paths = [
     join(process.cwd(), ".pi", "agents", `${agentName}.md`),
     join(homedir(), ".pi", "agent", "agents", `${agentName}.md`),
-    join(dirname(new URL(import.meta.url).pathname), "../../agents", `${agentName}.md`),
+    join(PACKAGE_AGENTS_DIR, `${agentName}.md`),
   ];
   for (const p of paths) {
     if (!existsSync(p)) continue;
@@ -238,9 +245,9 @@ async function runSubagent(
     // Build the task message
     const modeHint = interactive
       ? "The user will interact with you here. When done, they will exit with Ctrl+D."
-      : "Complete your task autonomously. When finished, call the subagent_done tool to close this session.";
+      : "Complete your task autonomously. When finished, call the subagent_done_with_summary tool to close this session (fallback: subagent_done).";
     const summaryInstruction =
-      "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+      "At the end, provide one concise final summary of what you accomplished. Then immediately call subagent_done_with_summary with that same summary in the `summary` field. If unavailable, call subagent_done as fallback.";
     const identity = agentDefs?.body ?? params.systemPrompt ?? null;
     const roleBlock = identity ? `\n\n${identity}` : "";
     const fullTask = `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
@@ -253,8 +260,7 @@ async function runSubagent(
       parts.push("--fork", shellEscape(sessionFile));
     }
 
-    const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
-    parts.push("-e", shellEscape(subagentDonePath));
+    parts.push("-e", shellEscape(SUBAGENT_DONE_EXTENSION_PATH));
 
     if (effectiveModel) {
       const model = effectiveThinking
@@ -337,7 +343,13 @@ async function runSubagent(
     let summary: string;
     if (subSessionFile) {
       const allEntries = getNewEntries(subSessionFile.path, 0);
+      const structuredSummary = findLastToolResultDetailText(
+        allEntries,
+        "subagent_done_with_summary",
+        "summary",
+      );
       summary =
+        structuredSummary ??
         findLastAssistantMessage(allEntries) ??
         (exitCode !== 0
           ? `Sub-agent exited with code ${exitCode}`
@@ -839,7 +851,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const agents = new Map<string, { name: string; description?: string; model?: string; source: string }>();
 
       const dirs = [
-        { path: join(dirname(new URL(import.meta.url).pathname), "../../agents"), source: "package" },
+        { path: PACKAGE_AGENTS_DIR, source: "package" },
         { path: join(homedir(), ".pi", "agent", "agents"), source: "global" },
         { path: join(process.cwd(), ".pi", "agents"), source: "project" },
       ];
@@ -1030,8 +1042,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+        parts.push("-e", shellEscape(SUBAGENT_DONE_EXTENSION_PATH));
 
         if (params.message) {
           // Write follow-up message to a temp file and pass via @file
@@ -1075,7 +1086,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Extract summary from new entries
         const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
+        const structuredSummary = findLastToolResultDetailText(
+          allEntries,
+          "subagent_done_with_summary",
+          "summary",
+        );
         const summary =
+          structuredSummary ??
           findLastAssistantMessage(allEntries) ??
           (exitCode !== 0
             ? `Resumed session exited with code ${exitCode}`
@@ -1171,10 +1188,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       // Load the plan skill from the subagents extension directory
-      const planSkillPath = join(dirname(new URL(import.meta.url).pathname), "plan-skill.md");
-      let content = readFileSync(planSkillPath, "utf8");
+      let content = readFileSync(PLAN_SKILL_PATH, "utf8");
       content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
-      pi.sendUserMessage(`<skill name="plan" location="${planSkillPath}">\n${content.trim()}\n</skill>\n\n${task}`);
+      pi.sendUserMessage(`<skill name="plan" location="${PLAN_SKILL_PATH}">\n${content.trim()}\n</skill>\n\n${task}`);
     },
   });
 }

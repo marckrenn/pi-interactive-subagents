@@ -17,6 +17,16 @@ export interface MessageEntry extends SessionEntry {
   };
 }
 
+export interface ToolResultMessageEntry extends SessionEntry {
+  type: "message";
+  message: {
+    role: "toolResult";
+    toolName?: string;
+    details?: Record<string, unknown>;
+    content?: Array<{ type: string; text?: string; [key: string]: unknown }>;
+  };
+}
+
 function readEntries(sessionFile: string): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
   return raw
@@ -66,6 +76,32 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
 
     if (texts.length > 0) return texts.join("\n");
   }
+  return null;
+}
+
+/**
+ * Find the latest text detail emitted by a specific tool result.
+ * Useful for structured handoffs (e.g. subagent_done_with_summary).
+ */
+export function findLastToolResultDetailText(
+  entries: SessionEntry[],
+  toolName: string,
+  detailKey: string,
+): string | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "message") continue;
+
+    const msg = entry as ToolResultMessageEntry;
+    if (msg.message.role !== "toolResult") continue;
+    if (msg.message.toolName !== toolName) continue;
+
+    const value = msg.message.details?.[detailKey];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value;
+    }
+  }
+
   return null;
 }
 
