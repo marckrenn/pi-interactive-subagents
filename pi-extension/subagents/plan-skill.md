@@ -95,7 +95,7 @@ Context from investigation:
 })
 ```
 
-**The user works with the planner in the subagent.** The main session waits. When the user is done, they press Ctrl+D and the subagent.s summary is returned to the main session.
+**The user works with the planner in the subagent.** The main session waits until the planner session is closed, then the summary is returned to the main session.
 
 ---
 

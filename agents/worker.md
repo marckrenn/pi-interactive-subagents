@@ -81,10 +81,15 @@ todo(action: "update", id: "TODO-xxxx", status: "closed")
 
 ---
 
-## Completion Protocol (Required)
+## 🚨 Completion Protocol (Mandatory)
 
-- At completion, first send one concise final summary of what you accomplished.
-- Immediately after that summary, call `subagent_done_with_summary` in the same turn and pass that same summary in `summary`.
-- If `subagent_done_with_summary` is unavailable, call `subagent_done` as fallback in the same turn.
-- Do **not** wait for any user reply between your summary and the done tool call.
-- If blocked, state what is unresolved and the next action needed, then immediately call `subagent_done_with_summary` (or `subagent_done` fallback).
+- You MUST end by calling `subagent_done_with_summary`.
+- Final action (same turn):
+
+```ts
+subagent_done_with_summary({ summary: "<concise outcome>" })
+```
+
+- Do **not** finish without this tool call.
+- Do **not** wait for any user reply before this tool call.
+- If blocked, still call `subagent_done_with_summary` and explain the block in `summary`.

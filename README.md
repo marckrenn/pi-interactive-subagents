@@ -175,7 +175,7 @@ subagent({
 | `name` | string | required | Display name (shown in pane title/tab) |
 | `task` | string | required | Task prompt for the sub-agent |
 | `agent` | string | — | Load defaults from agent definition |
-| `interactive` | boolean | `true` | User collaborates vs. autonomous |
+| `interactive` | boolean | `false` | User collaborates vs. autonomous |
 | `fork` | boolean | `false` | Copy current session for full context |
 | `model` | string | — | Override agent's default model |
 | `systemPrompt` | string | — | Append to system prompt |

@@ -40,7 +40,7 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Appended to system prompt (role instructions)" })
   ),
   interactive: Type.Optional(
-    Type.Boolean({ description: "true = user collaborates, false = autonomous. Default: true" })
+    Type.Boolean({ description: "true = user collaborates, false = autonomous. Default: false" })
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
   skills: Type.Optional(Type.String({ description: "Comma-separated skills (overrides agent default)" })),
@@ -215,7 +215,7 @@ async function runSubagent(
   onProgress?: (info: { elapsed: string; entries?: number; bytes?: number }) => void,
   options?: { surface?: string; claimedFiles?: Set<string> },
 ): Promise<SubagentResult> {
-  const interactive = params.interactive !== false;
+  const interactive = params.interactive === true;
   const startTime = Date.now();
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
@@ -244,13 +244,17 @@ async function runSubagent(
 
     // Build the task message
     const modeHint = interactive
-      ? "The user will interact with you here. When done, they will exit with Ctrl+D."
-      : "Complete your task autonomously. When finished, call the subagent_done_with_summary tool to close this session (fallback: subagent_done).";
+      ? "The user will interact with you here."
+      : "Complete your task autonomously.";
     const summaryInstruction =
-      "At the end, provide one concise final summary of what you accomplished. Then immediately call subagent_done_with_summary with that same summary in the `summary` field. If unavailable, call subagent_done as fallback.";
+      "🚨 MANDATORY END STEP — DO NOT SKIP 🚨\n" +
+      "You MUST end by calling subagent_done_with_summary.\n" +
+      "Final action format: subagent_done_with_summary({ summary: \"<concise outcome>\" })\n" +
+      "Do not end the task without this tool call. Do not wait for a user reply before calling it.";
     const identity = agentDefs?.body ?? params.systemPrompt ?? null;
     const roleBlock = identity ? `\n\n${identity}` : "";
-    const fullTask = `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+    // Inject steering reminder at session start (inside the initial task file).
+    const fullTask = `${summaryInstruction}\n\n${roleBlock}\n\n${modeHint}\n\n${params.task}`;
 
     // Build pi command
     const parts: string[] = ["pi"];
@@ -320,6 +324,7 @@ async function runSubagent(
             claimedFiles.add(basename(progress.file));
           }
         }
+
         onProgress?.({ elapsed, entries: progress?.entries, bytes: progress?.bytes });
       },
     });
@@ -341,6 +346,7 @@ async function runSubagent(
 
     // Extract summary
     let summary: string;
+    let summaryError: string | undefined;
     if (subSessionFile) {
       const allEntries = getNewEntries(subSessionFile.path, 0);
       const structuredSummary = findLastToolResultDetailText(
@@ -348,17 +354,31 @@ async function runSubagent(
         "subagent_done_with_summary",
         "summary",
       );
-      summary =
-        structuredSummary ??
-        findLastAssistantMessage(allEntries) ??
-        (exitCode !== 0
-          ? `Sub-agent exited with code ${exitCode}`
-          : "Sub-agent exited without output");
+
+      if (structuredSummary) {
+        summary = structuredSummary;
+      } else if (interactive) {
+        summary =
+          findLastAssistantMessage(allEntries) ??
+          (exitCode !== 0
+            ? `Sub-agent exited with code ${exitCode}`
+            : "Sub-agent exited without output");
+        summaryError = "missing subagent_done_with_summary";
+      } else {
+        summary =
+          exitCode !== 0
+            ? `Sub-agent exited with code ${exitCode} before calling subagent_done_with_summary.`
+            : "Sub-agent did not call subagent_done_with_summary.";
+        summaryError = "missing subagent_done_with_summary";
+      }
     } else {
       summary = exitCode !== 0
         ? `Sub-agent exited with code ${exitCode}`
         : "Sub-agent exited without output";
+      summaryError = "missing subagent_done_with_summary";
     }
+
+    const finalExitCode = summaryError ? 1 : exitCode;
 
     closeSurface(surface);
     surface = null;
@@ -369,8 +389,9 @@ async function runSubagent(
       summary,
       sessionFile: subSessionFile?.path,
       interactive,
-      exitCode,
+      exitCode: finalExitCode,
       elapsed,
+      error: summaryError,
     };
   } catch (err: any) {
     if (surface) {
@@ -411,7 +432,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     parameters: SubagentParams,
 
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      const interactive = params.interactive !== false;
+      const interactive = params.interactive === true;
 
       // Validate prerequisites
       if (!isMuxAvailable()) {
@@ -454,7 +475,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (result.error) {
         return {
           content: [{ type: "text", text: result.summary }],
-          details: { error: result.error },
+          details: {
+            error: result.error,
+            name: params.name,
+            task: params.task,
+            sessionFile: result.sessionFile,
+            interactive,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+          },
         };
       }
 
@@ -480,7 +509,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      const interactive = args.interactive !== false;
+      const interactive = args.interactive === true;
       const icon = interactive ? "▸" : "▹";
       const mode = interactive ? "interactive session" : "autonomous";
       const agent = args.agent ? theme.fg("dim", ` (${args.agent})`) : "";
@@ -512,7 +541,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     renderResult(result, { expanded, isPartial }, theme) {
       const details = result.details as any;
       const name = details?.name ?? "(unnamed)";
-      const interactive = details?.interactive !== false;
+      const interactive = details?.interactive === true;
 
       if (isPartial) {
         const startTime: number | undefined = details?.startTime;
@@ -1134,8 +1163,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const task = args?.trim() || "";
       const toolCall = task
-        ? `Use subagent to start an interactive iterate session. fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
-        : `Use subagent to start an interactive iterate session. fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
+        ? `Use subagent to start an interactive iterate session. interactive: true, fork: true, name: "Iterate", task: ${JSON.stringify(task)}`
+        : `Use subagent to start an interactive iterate session. interactive: true, fork: true, name: "Iterate", task: "The user wants to do some hands-on work. Help them with whatever they need."`;
       pi.sendUserMessage(toolCall);
     },
   });
