@@ -1,7 +1,6 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity in the status bar (always visible)
- * - Shows available tools as a styled widget above the editor (toggle with Ctrl+J)
+ * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -23,9 +22,13 @@ export default function (pi: ExtensionAPI) {
       (_tui: any, theme: any) => {
         const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
 
+        const label = subagentAgent || subagentName;
+        const agentTag = label
+          ? theme.bold(theme.fg("accent", `[${label}]`))
+          : "";
+
         if (expanded) {
           // Expanded: full tool list + denied
-          const title = theme.bold(theme.fg("toolTitle", "Subagent Tools"));
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
           const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
 
@@ -42,21 +45,20 @@ export default function (pi: ExtensionAPI) {
           }
 
           const content = new Text(
-            `${title}${countInfo}${hint}\n${toolList}${deniedLine}`,
+            `${agentTag}${countInfo}${hint}\n${toolList}${deniedLine}`,
             0,
             0,
           );
           box.addChild(content);
         } else {
           // Collapsed: one-line summary
-          const title = theme.bold(theme.fg("toolTitle", "Subagent Tools"));
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
           const deniedInfo = denied.length > 0
             ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
             : "";
           const hint = theme.fg("muted", "  (Ctrl+J to expand)");
 
-          const content = new Text(`${title}${countInfo}${deniedInfo}${hint}`, 0, 0);
+          const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
           box.addChild(content);
         }
 
@@ -74,12 +76,6 @@ export default function (pi: ExtensionAPI) {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
-
-    // Set agent identity in the status bar — always visible
-    const label = subagentAgent || subagentName;
-    if (label) {
-      ctx.ui.setStatus("subagent", `{subagent: ${label}}`);
-    }
 
     renderWidget(ctx, null);
   });
