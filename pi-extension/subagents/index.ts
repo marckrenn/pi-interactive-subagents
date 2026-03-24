@@ -227,19 +227,41 @@ interface SubagentResult {
 }
 
 /**
- * Core subagent execution logic. Spawns a sub-agent in a multiplexer pane,
- * polls for completion, extracts the summary, and returns a structured result.
- *
- * Used by both `subagent` (single) and `parallel_subagents` (concurrent) tools.
+ * State for a launched (but not yet completed) subagent.
  */
-async function runSubagent(
+interface RunningSubagent {
+  id: string;
+  name: string;
+  task: string;
+  agent?: string;
+  surface: string;
+  startTime: number;
+  sessionDir: string;
+  existingSessionFiles: Set<string>;
+  trackedSessionFile?: string;
+  claimedFiles?: Set<string>;
+  entries?: number;
+  bytes?: number;
+  forkCleanupFile?: string;
+}
+
+/** All currently running subagents, keyed by id. */
+const runningSubagents = new Map<string, RunningSubagent>();
+
+/**
+ * Launch a subagent: creates the multiplexer pane, builds the command, and
+ * sends it. Returns a RunningSubagent — does NOT poll.
+ *
+ * For blocking execution, call watchSubagent() on the returned object.
+ * runSubagent() is a convenience wrapper that does both.
+ */
+async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
-  signal: AbortSignal,
-  onProgress?: (info: { elapsed: string; entries?: number; bytes?: number }) => void,
   options?: { surface?: string; claimedFiles?: Set<string> },
-): Promise<SubagentResult> {
+): Promise<RunningSubagent> {
   const startTime = Date.now();
+  const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
@@ -250,142 +272,169 @@ async function runSubagent(
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
 
-  let surface: string | null = null;
+  const sessionDir = dirname(sessionFile);
+  const existingSessionFiles = new Set(
+    readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
+  );
+
+  // Use pre-created surface (parallel mode) or create a new one.
+  // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
+  const surface = options?.surface ?? createSurface(params.name);
+  if (!surfacePreCreated) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  }
+
+  // Build the task message
+  // When forking, the sub-agent already has the full conversation context.
+  // Only send the user's task as a clean message — no wrapper instructions
+  // that would confuse the agent into thinking it needs to restart.
+  const modeHint = "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
+  const summaryInstruction =
+    "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+  const denySet = resolveDenyTools(agentDefs);
+  const agentType = params.agent ?? params.name;
+  const tabTitleInstruction = denySet.has("set_tab_title") ? "" :
+    `As your FIRST action, set the tab title using set_tab_title. ` +
+    `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
+    `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
+  const identity = agentDefs?.body ?? params.systemPrompt ?? null;
+  const roleBlock = identity ? `\n\n${identity}` : "";
+  const fullTask = params.fork
+    ? params.task
+    : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
+
+  // Build pi command
+  const parts: string[] = ["pi"];
+  parts.push("--session-dir", shellEscape(dirname(sessionFile)));
+
+  // For fork mode, create a clean copy of the session that excludes
+  // the "Use subagent..." meta-message and tool call that triggered this.
+  // The forked session sees only the original conversation + the user's actual task.
+  let forkCleanupFile: string | undefined;
+  if (params.fork) {
+    const raw = readFileSync(sessionFile, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim());
+
+    // Walk backwards to find the last user message (the meta-instruction)
+    // and truncate everything from there onwards
+    let truncateAt = lines.length;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.type === "message" && entry.message?.role === "user") {
+          truncateAt = i;
+          break;
+        }
+      } catch {}
+    }
+
+    const cleanLines = lines.slice(0, truncateAt);
+    forkCleanupFile = join(tmpdir(), `pi-fork-clean-${Date.now()}.jsonl`);
+    writeFileSync(forkCleanupFile, cleanLines.join("\n") + "\n", "utf8");
+    parts.push("--fork", shellEscape(forkCleanupFile));
+  }
+
+  const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
+  parts.push("-e", shellEscape(subagentDonePath));
+
+  if (effectiveModel) {
+    const model = effectiveThinking
+      ? `${effectiveModel}:${effectiveThinking}`
+      : effectiveModel;
+    parts.push("--model", shellEscape(model));
+  }
+
+  if (effectiveTools) {
+    const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+    const builtins = effectiveTools.split(",").map((t) => t.trim()).filter((t) => BUILTIN_TOOLS.has(t));
+    if (builtins.length > 0) {
+      parts.push("--tools", shellEscape(builtins.join(",")));
+    }
+  }
+
+  if (effectiveSkills) {
+    for (const skill of effectiveSkills.split(",").map((s) => s.trim()).filter(Boolean)) {
+      parts.push(shellEscape(`/skill:${skill}`));
+    }
+  }
+
+  // Build env prefix: denied tools + subagent identity
+  const envParts: string[] = [];
+  if (denySet.size > 0) {
+    envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
+  }
+  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  if (params.agent) {
+    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
+  }
+  const envPrefix = envParts.join(" ") + " ";
+
+  // Pass task to the sub-agent.
+  // For fork mode, pass as a plain quoted argument — the forked session already
+  // has the full conversation context, so the message arrives as if the user typed it.
+  // For non-fork mode, write to an artifact file and pass via @file to handle
+  // long task descriptions with role/instructions safely.
+  if (params.fork) {
+    parts.push(shellEscape(fullTask));
+  } else {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const artifactDir = getArtifactDir(ctx.cwd, sessionId);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const artifactName = `context/${params.name.toLowerCase().replace(/\s+/g, "-")}-${timestamp}.md`;
+    const artifactPath = join(artifactDir, artifactName);
+    mkdirSync(dirname(artifactPath), { recursive: true });
+    writeFileSync(artifactPath, fullTask, "utf8");
+    parts.push(`@${artifactPath}`);
+  }
+
+  // Resolve cwd — param overrides agent default, supports absolute and relative paths
+  const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
+  const effectiveCwd = rawCwd
+    ? (rawCwd.startsWith("/") ? rawCwd : join(process.cwd(), rawCwd))
+    : null;
+  const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
+
+  const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
+  sendCommand(surface, command);
+
+  const running: RunningSubagent = {
+    id,
+    name: params.name,
+    task: params.task,
+    agent: params.agent,
+    surface,
+    startTime,
+    sessionDir,
+    existingSessionFiles,
+    claimedFiles: options?.claimedFiles,
+    forkCleanupFile,
+  };
+
+  runningSubagents.set(id, running);
+  return running;
+}
+
+/**
+ * Watch a launched subagent until it exits. Polls for completion, extracts
+ * the summary from the session file, cleans up the surface and fork file,
+ * and removes the entry from runningSubagents.
+ */
+async function watchSubagent(
+  running: RunningSubagent,
+  signal: AbortSignal,
+  onProgress?: (info: { elapsed: string; entries?: number; bytes?: number }) => void,
+): Promise<SubagentResult> {
+  const { name, task, surface, startTime, sessionDir, existingSessionFiles, forkCleanupFile } = running;
+
+  // Track which session file belongs to THIS agent.
+  // In parallel mode, multiple agents share the same session directory.
+  // Without tracking, they'd all pick the "newest" file (same one).
+  let trackedFile = running.trackedSessionFile ?? null;
+  const claimedFiles = running.claimedFiles;
 
   try {
-    const sessionDir = dirname(sessionFile);
-    const existingSessionFiles = new Set(
-      readdirSync(sessionDir).filter((f) => f.endsWith(".jsonl"))
-    );
-
-    // Use pre-created surface (parallel mode) or create a new one
-    surface = options?.surface ?? createSurface(params.name);
-    if (!surfacePreCreated) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 500));
-    }
-
-    // Build the task message
-    // When forking, the sub-agent already has the full conversation context.
-    // Only send the user's task as a clean message — no wrapper instructions
-    // that would confuse the agent into thinking it needs to restart.
-    const modeHint = "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-    const summaryInstruction =
-      "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
-    const denySet = resolveDenyTools(agentDefs);
-    const agentType = params.agent ?? params.name;
-    const tabTitleInstruction = denySet.has("set_tab_title") ? "" :
-      `As your FIRST action, set the tab title using set_tab_title. ` +
-      `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
-      `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
-    const identity = agentDefs?.body ?? params.systemPrompt ?? null;
-    const roleBlock = identity ? `\n\n${identity}` : "";
-    const fullTask = params.fork
-      ? params.task
-      : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
-
-    // Build pi command
-    const parts: string[] = ["pi"];
-    parts.push("--session-dir", shellEscape(dirname(sessionFile)));
-
-    // For fork mode, create a clean copy of the session that excludes
-    // the "Use subagent..." meta-message and tool call that triggered this.
-    // The forked session sees only the original conversation + the user's actual task.
-    let forkCleanupFile: string | null = null;
-    if (params.fork) {
-      const raw = readFileSync(sessionFile, "utf8");
-      const lines = raw.split("\n").filter((l) => l.trim());
-
-      // Walk backwards to find the last user message (the meta-instruction)
-      // and truncate everything from there onwards
-      let truncateAt = lines.length;
-      for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const entry = JSON.parse(lines[i]);
-          if (entry.type === "message" && entry.message?.role === "user") {
-            truncateAt = i;
-            break;
-          }
-        } catch {}
-      }
-
-      const cleanLines = lines.slice(0, truncateAt);
-      forkCleanupFile = join(tmpdir(), `pi-fork-clean-${Date.now()}.jsonl`);
-      writeFileSync(forkCleanupFile, cleanLines.join("\n") + "\n", "utf8");
-      parts.push("--fork", shellEscape(forkCleanupFile));
-    }
-
-    const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
-    parts.push("-e", shellEscape(subagentDonePath));
-
-    if (effectiveModel) {
-      const model = effectiveThinking
-        ? `${effectiveModel}:${effectiveThinking}`
-        : effectiveModel;
-      parts.push("--model", shellEscape(model));
-    }
-
-    if (effectiveTools) {
-      const BUILTIN_TOOLS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-      const builtins = effectiveTools.split(",").map((t) => t.trim()).filter((t) => BUILTIN_TOOLS.has(t));
-      if (builtins.length > 0) {
-        parts.push("--tools", shellEscape(builtins.join(",")));
-      }
-    }
-
-    if (effectiveSkills) {
-      for (const skill of effectiveSkills.split(",").map((s) => s.trim()).filter(Boolean)) {
-        parts.push(shellEscape(`/skill:${skill}`));
-      }
-    }
-
-    // Build env prefix: denied tools + subagent identity
-    const envParts: string[] = [];
-    if (denySet.size > 0) {
-      envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
-    }
-    envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-    if (params.agent) {
-      envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-    }
-    const envPrefix = envParts.join(" ") + " ";
-
-    // Pass task to the sub-agent.
-    // For fork mode, pass as a plain quoted argument — the forked session already
-    // has the full conversation context, so the message arrives as if the user typed it.
-    // For non-fork mode, write to an artifact file and pass via @file to handle
-    // long task descriptions with role/instructions safely.
-    if (params.fork) {
-      parts.push(shellEscape(fullTask));
-    } else {
-      const sessionId = ctx.sessionManager.getSessionId();
-      const artifactDir = getArtifactDir(ctx.cwd, sessionId);
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      const artifactName = `context/${params.name.toLowerCase().replace(/\s+/g, "-")}-${timestamp}.md`;
-      const artifactPath = join(artifactDir, artifactName);
-      mkdirSync(dirname(artifactPath), { recursive: true });
-      writeFileSync(artifactPath, fullTask, "utf8");
-      parts.push(`@${artifactPath}`);
-    }
-
-    // Resolve cwd — param overrides agent default, supports absolute and relative paths
-    const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
-    const effectiveCwd = rawCwd
-      ? (rawCwd.startsWith("/") ? rawCwd : join(process.cwd(), rawCwd))
-      : null;
-    const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-
-    const piCommand = cdPrefix + envPrefix + parts.join(" ");
-    const command = `${piCommand}; echo '__SUBAGENT_DONE_'${exitStatusVar()}'__'`;
-    sendCommand(surface, command);
-
-    // Track which session file belongs to THIS agent.
-    // In parallel mode, multiple agents share the same session directory.
-    // Without tracking, they'd all pick the "newest" file (same one).
-    let trackedFile: string | null = null;
-    const claimedFiles = options?.claimedFiles;
-
-    // Poll for exit
     const exitCode = await pollForExit(surface, signal, {
       interval: 1000,
       onTick() {
@@ -397,6 +446,7 @@ async function runSubagent(
         if (progress && !trackedFile) {
           // Lock onto this file and claim it so other parallel agents skip it
           trackedFile = progress.file;
+          running.trackedSessionFile = progress.file;
           if (claimedFiles) {
             claimedFiles.add(basename(progress.file));
           }
@@ -436,33 +486,25 @@ async function runSubagent(
     }
 
     closeSurface(surface);
-    surface = null;
+    runningSubagents.delete(running.id);
 
     // Clean up temp fork file
     if (forkCleanupFile) {
       try { unlinkSync(forkCleanupFile); } catch {}
     }
 
-    return {
-      name: params.name,
-      task: params.task,
-      summary,
-      sessionFile: subSessionFile?.path,
-      exitCode,
-      elapsed,
-    };
+    return { name, task, summary, sessionFile: subSessionFile?.path, exitCode, elapsed };
   } catch (err: any) {
     if (forkCleanupFile) {
       try { unlinkSync(forkCleanupFile); } catch {}
     }
-    if (surface) {
-      try { closeSurface(surface); } catch {}
-      surface = null;
-    }
+    try { closeSurface(surface); } catch {}
+    runningSubagents.delete(running.id);
+
     if (signal.aborted) {
       return {
-        name: params.name,
-        task: params.task,
+        name,
+        task,
         summary: "Subagent cancelled.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
@@ -470,14 +512,29 @@ async function runSubagent(
       };
     }
     return {
-      name: params.name,
-      task: params.task,
+      name,
+      task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
     };
   }
+}
+
+/**
+ * Convenience wrapper: launch a subagent and wait for it to complete.
+ * Existing tools call this and continue to behave exactly as before.
+ */
+async function runSubagent(
+  params: typeof SubagentParams.static,
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string }; cwd: string },
+  signal: AbortSignal,
+  onProgress?: (info: { elapsed: string; entries?: number; bytes?: number }) => void,
+  options?: { surface?: string; claimedFiles?: Set<string> },
+): Promise<SubagentResult> {
+  const running = await launchSubagent(params, ctx, options);
+  return watchSubagent(running, signal, onProgress);
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
