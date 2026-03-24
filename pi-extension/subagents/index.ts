@@ -243,6 +243,7 @@ interface RunningSubagent {
   entries?: number;
   bytes?: number;
   forkCleanupFile?: string;
+  abortController?: AbortController;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -559,7 +560,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "and returns results via a branch summary. Supports cmux, tmux, and zellij.",
     parameters: SubagentParams,
 
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       // Prevent self-spawning (e.g. planner spawning another planner)
       const currentAgent = process.env.PI_SUBAGENT_AGENT;
       if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -581,53 +582,54 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       }
 
-      const startTime = Date.now();
+      // Launch the subagent (creates pane, sends command)
+      const running = await launchSubagent(params, ctx);
 
-      onUpdate?.({
-        content: [{ type: "text", text: "starting…" }],
-        details: {
-          name: params.name,
-          task: params.task,
-          startTime,
-        },
-      });
+      // Create a separate AbortController for the watcher
+      // (the tool's signal completes when we return)
+      const watcherAbort = new AbortController();
+      running.abortController = watcherAbort;
 
-      const result = await runSubagent(params, ctx, signal ?? new AbortController().signal, (info) => {
-        onUpdate?.({
-          content: [{ type: "text", text: `${info.elapsed} elapsed` }],
+      // Fire-and-forget: start watching in background
+      watchSubagent(running, watcherAbort.signal).then((result) => {
+        const sessionRef = result.sessionFile
+          ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+          : "";
+        const content = result.exitCode !== 0
+          ? `Sub-agent "${running.name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
+          : `Sub-agent "${running.name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+
+        pi.sendMessage({
+          customType: "subagent_result",
+          content,
+          display: true,
           details: {
-            name: params.name,
-            task: params.task,
-            startTime,
-            sessionEntries: info.entries,
-            sessionBytes: info.bytes,
+            name: running.name,
+            task: running.task,
+            agent: running.agent,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
           },
-        });
+        }, { triggerTurn: true, deliverAs: "steer" });
+      }).catch((err) => {
+        pi.sendMessage({
+          customType: "subagent_result",
+          content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: { name: running.name, task: running.task, error: err?.message },
+        }, { triggerTurn: true, deliverAs: "steer" });
       });
 
-      if (result.error) {
-        return {
-          content: [{ type: "text", text: result.summary }],
-          details: { error: result.error },
-        };
-      }
-
-      const sessionRef = result.sessionFile
-        ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
-        : "";
-      const resultText =
-        result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}.\n\n${result.summary}${sessionRef}`
-          : `${result.summary}${sessionRef}`;
-
+      // Return immediately
       return {
-        content: [{ type: "text", text: resultText }],
+        content: [{ type: "text", text: `Sub-agent "${params.name}" started.` }],
         details: {
+          id: running.id,
           name: params.name,
           task: params.task,
-          sessionFile: result.sessionFile,
-          exitCode: result.exitCode,
-          elapsed: result.elapsed,
+          agent: params.agent,
+          status: "started",
         },
       };
     },
@@ -660,82 +662,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
 
-    renderResult(result, { expanded, isPartial }, theme) {
+    renderResult(result, _opts, theme) {
       const details = result.details as any;
       const name = details?.name ?? "(unnamed)";
 
-      if (isPartial) {
-        const startTime: number | undefined = details?.startTime;
-        const sessionEntries: number | undefined = details?.sessionEntries;
-        const sessionBytes: number | undefined = details?.sessionBytes;
-
-        const elapsedText = startTime
-          ? formatElapsed(Math.floor((Date.now() - startTime) / 1000))
-          : "…";
-
-        let progressParts: string[] = [elapsedText];
-        if (sessionEntries != null && sessionBytes != null) {
-          progressParts.push(`${sessionEntries} msgs (${formatBytes(sessionBytes)})`);
-        } else {
-          progressParts.push("loading…");
-        }
-
-        const text = theme.fg("dim", progressParts.join(" · "));
-        return new Text(text, 0, 0);
-      }
-
-      // Completed
-      const exitCode = details?.exitCode ?? 0;
-      const elapsed = details?.elapsed != null ? formatElapsed(details.elapsed) : "?";
-      const summaryText =
-        typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
-
-      if (exitCode !== 0) {
-        const text =
-          theme.fg("error", "✗") +
-          " " +
+      // "Started" result — tool returned immediately
+      if (details?.status === "started") {
+        return new Text(
+          theme.fg("accent", "▸") + " " +
           theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", ` — failed (exit code ${exitCode})`);
-        return new Text(text, 0, 0);
+          theme.fg("dim", " — started"),
+          0, 0
+        );
       }
 
-      // Strip session path from summary for the preview (it's shown separately)
-      const sessionPath: string | undefined = details?.sessionFile;
-      const cleanSummary = summaryText.replace(/\n\nSession: .+\nResume: .+$/, "").replace(/\n\nSession: .+$/, "");
-
-      let text =
-        theme.fg("success", "✓") +
-        " " +
-        theme.fg("toolTitle", theme.bold(name)) +
-        theme.fg("dim", ` — completed (${elapsed})`);
-
-      if (expanded) {
-        // Full view: task + summary + session info
-        const task: string | undefined = details?.task;
-        if (task) {
-          text += "\n" + theme.fg("dim", "─── task ───");
-          text += "\n" + theme.fg("toolOutput", task);
-          text += "\n" + theme.fg("dim", "─── result ───");
-        }
-        if (cleanSummary) {
-          text += "\n" + theme.fg("text", cleanSummary);
-        }
-        if (sessionPath) {
-          text += "\n" + theme.fg("dim", `Session: ${sessionPath}`);
-          text += "\n" + theme.fg("dim", `Resume:  pi --session ${sessionPath}`);
-        }
-      } else {
-        // Collapsed: one-line preview + expand hint
-        const preview = cleanSummary.length > 120
-          ? cleanSummary.slice(0, 120) + "…"
-          : cleanSummary;
-        if (preview) {
-          text += "\n" + theme.fg("text", preview);
-        }
-        text += " " + theme.fg("muted", `(${keyHint("app.tools.expand", "to expand")})`);
-      }
-
-      return new Text(text, 0, 0);
+      // Fallback (shouldn't happen)
+      const text = typeof result.content?.[0]?.text === "string" ? result.content[0].text : "";
+      return new Text(theme.fg("dim", text), 0, 0);
     },
   });
 
@@ -1328,6 +1271,45 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const toolCall = `Use subagent with agent: "${agentName}", name: "${agentName[0].toUpperCase() + agentName.slice(1)}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
+  });
+
+  // ── subagent_result message renderer ──
+  pi.registerMessageRenderer("subagent_result", (message, _options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+
+    return {
+      render(width: number): string[] {
+        const name = details.name ?? "subagent";
+        const exitCode = details.exitCode ?? 0;
+        const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
+        const icon = exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+        const status = exitCode === 0 ? "completed" : `failed (exit ${exitCode})`;
+
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))} — ${status} (${elapsed})`;
+        const content = typeof message.content === "string" ? message.content : "";
+
+        // Clean summary (remove session ref and leading label for display)
+        const summary = content
+          .replace(/\n\nSession: .+\nResume: .+$/, "")
+          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
+          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "");
+
+        const lines = [header];
+        if (summary) {
+          const summaryLines = summary.split("\n").slice(0, 5);
+          for (const line of summaryLines) {
+            lines.push("  " + line.slice(0, width - 4));
+          }
+          const totalLines = summary.split("\n").length;
+          if (totalLines > 5) {
+            lines.push(theme.fg("dim", `  ... (${totalLines - 5} more lines)`));
+          }
+        }
+
+        return lines;
+      }
+    };
   });
 
   // /plan command — start the full planning workflow
