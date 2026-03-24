@@ -1,7 +1,7 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { basename, dirname, join } from "node:path";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -200,6 +200,105 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+}
+
+interface RunningSubagent {
+  id: string;
+  name: string;
+  task: string;
+  agent?: string;
+  interactive: boolean;
+  startTime: number;
+  abortController: AbortController;
+  entries?: number;
+  bytes?: number;
+}
+
+const runningSubagents = new Map<string, RunningSubagent>();
+
+let latestCtx: ExtensionContext | null = null;
+let widgetInterval: ReturnType<typeof setInterval> | null = null;
+
+const ACCENT = "\x1b[38;2;77;163;255m";
+const RST = "\x1b[0m";
+
+function formatElapsedMMSS(startTime: number): string {
+  const seconds = Math.floor((Date.now() - startTime) / 1000);
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function borderLine(left: string, right: string, width: number): string {
+  const contentWidth = Math.max(0, width - 2);
+  const rightVis = visibleWidth(right);
+  const maxLeft = Math.max(0, contentWidth - rightVis);
+  const truncLeft = truncateToWidth(left, maxLeft);
+  const leftVis = visibleWidth(truncLeft);
+  const pad = Math.max(0, contentWidth - leftVis - rightVis);
+  return `${ACCENT}│${RST}${truncLeft}${" ".repeat(pad)}${right}${ACCENT}│${RST}`;
+}
+
+function borderTop(title: string, info: string, width: number): string {
+  const inner = Math.max(0, width - 2);
+  const titlePart = `─ ${title} `;
+  const infoPart = ` ${info} ─`;
+  const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
+  const fill = "─".repeat(fillLen);
+  const content = `${titlePart}${fill}${infoPart}`.slice(0, inner).padEnd(inner, "─");
+  return `${ACCENT}╭${content}╮${RST}`;
+}
+
+function borderBottom(width: number): string {
+  const inner = Math.max(0, width - 2);
+  return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
+}
+
+function updateWidget() {
+  if (!latestCtx?.hasUI) return;
+
+  if (runningSubagents.size === 0) {
+    latestCtx.ui.setWidget("subagent-status", undefined);
+    if (widgetInterval) {
+      clearInterval(widgetInterval);
+      widgetInterval = null;
+    }
+    return;
+  }
+
+  latestCtx.ui.setWidget(
+    "subagent-status",
+    () => ({
+      invalidate() {},
+      render(width: number) {
+        const count = runningSubagents.size;
+        const lines: string[] = [borderTop("Subagents", `${count} running`, width)];
+
+        for (const [, agent] of runningSubagents) {
+          const elapsed = formatElapsedMMSS(agent.startTime);
+          const agentTag = agent.agent ? ` (${agent.agent})` : "";
+          const left = ` ${elapsed}  ${agent.name}${agentTag} `;
+          const right =
+            agent.entries != null && agent.bytes != null
+              ? ` ${agent.entries} msgs (${formatBytes(agent.bytes)}) `
+              : " starting… ";
+          lines.push(borderLine(left, right, width));
+        }
+
+        lines.push(borderBottom(width));
+        return lines;
+      },
+    }),
+    { placement: "aboveEditor" },
+  );
+}
+
+function startWidgetRefresh() {
+  if (widgetInterval) return;
+  updateWidget();
+  widgetInterval = setInterval(() => {
+    updateWidget();
+  }, 1000);
 }
 
 /**
@@ -422,6 +521,24 @@ async function runSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  pi.on("session_start", (_event, ctx) => {
+    latestCtx = ctx;
+    updateWidget();
+  });
+
+  pi.on("session_shutdown", () => {
+    for (const [, running] of runningSubagents) {
+      running.abortController.abort();
+    }
+    runningSubagents.clear();
+
+    if (widgetInterval) {
+      clearInterval(widgetInterval);
+      widgetInterval = null;
+    }
+    latestCtx = null;
+  });
+
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
@@ -431,8 +548,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       "and returns results via a branch summary. Supports cmux, tmux, and zellij.",
     parameters: SubagentParams,
 
-    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const interactive = params.interactive === true;
+
+      const currentAgent = process.env.PI_SUBAGENT_AGENT;
+      if (params.agent && currentAgent && params.agent === currentAgent) {
+        return {
+          content: [{ type: "text", text: `You are the ${currentAgent} agent — do not start another ${currentAgent}. Complete the task directly.` }],
+          details: { error: "self-spawn blocked" },
+        };
+      }
 
       // Validate prerequisites
       if (!isMuxAvailable()) {
@@ -447,63 +572,81 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
 
       const startTime = Date.now();
+      const id = Math.random().toString(16).slice(2, 10);
+      const abortController = new AbortController();
 
-      onUpdate?.({
-        content: [{ type: "text", text: "starting…" }],
-        details: {
-          name: params.name,
-          interactive,
-          task: params.task,
-          startTime,
-        },
+      runningSubagents.set(id, {
+        id,
+        name: params.name,
+        task: params.task,
+        agent: params.agent,
+        interactive,
+        startTime,
+        abortController,
       });
+      startWidgetRefresh();
 
-      const result = await runSubagent(params, ctx, signal ?? new AbortController().signal, (info) => {
-        onUpdate?.({
-          content: [{ type: "text", text: `${info.elapsed} elapsed` }],
-          details: {
-            name: params.name,
-            interactive,
-            task: params.task,
-            startTime,
-            sessionEntries: info.entries,
-            sessionBytes: info.bytes,
-          },
-        });
-      });
+      void runSubagent(params, ctx, abortController.signal, (info) => {
+        const running = runningSubagents.get(id);
+        if (!running) return;
+        running.entries = info.entries;
+        running.bytes = info.bytes;
+        updateWidget();
+      }).then((result) => {
+        runningSubagents.delete(id);
+        updateWidget();
 
-      if (result.error) {
-        return {
-          content: [{ type: "text", text: result.summary }],
+        const sessionRef = result.sessionFile
+          ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
+          : "";
+
+        const content = result.exitCode !== 0
+          ? `Sub-agent "${params.name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
+          : `Sub-agent "${params.name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+
+        pi.sendMessage({
+          customType: "subagent_result",
+          content,
+          display: true,
           details: {
-            error: result.error,
+            id,
             name: params.name,
             task: params.task,
-            sessionFile: result.sessionFile,
+            agent: params.agent,
             interactive,
             exitCode: result.exitCode,
             elapsed: result.elapsed,
+            sessionFile: result.sessionFile,
+            error: result.error,
           },
-        };
-      }
-
-      const sessionRef = result.sessionFile
-        ? `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`
-        : "";
-      const resultText =
-        result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}.\n\n${result.summary}${sessionRef}`
-          : `${result.summary}${sessionRef}`;
+        }, { triggerTurn: true, deliverAs: "steer" });
+      }).catch((err: any) => {
+        runningSubagents.delete(id);
+        updateWidget();
+        pi.sendMessage({
+          customType: "subagent_result",
+          content: `Sub-agent "${params.name}" error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: {
+            id,
+            name: params.name,
+            task: params.task,
+            agent: params.agent,
+            interactive,
+            error: err?.message ?? String(err),
+          },
+        }, { triggerTurn: true, deliverAs: "steer" });
+      });
 
       return {
-        content: [{ type: "text", text: resultText }],
+        content: [{ type: "text", text: `Sub-agent "${params.name}" started.` }],
         details: {
+          id,
           name: params.name,
           task: params.task,
-          sessionFile: result.sessionFile,
+          agent: params.agent,
           interactive,
-          exitCode: result.exitCode,
-          elapsed: result.elapsed,
+          status: "started",
         },
       };
     },
@@ -542,6 +685,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const details = result.details as any;
       const name = details?.name ?? "(unnamed)";
       const interactive = details?.interactive === true;
+
+      if (details?.status === "started") {
+        return new Text(
+          theme.fg("accent", "▸") + " " +
+          theme.fg("toolTitle", theme.bold(name)) +
+          theme.fg("dim", " — started"),
+          0,
+          0,
+        );
+      }
 
       if (isPartial) {
         const startTime: number | undefined = details?.startTime;
@@ -1193,6 +1346,64 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const toolCall = `Use subagent with agent: "${agentName}", name: "${agentName[0].toUpperCase() + agentName.slice(1)}", interactive: false, task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
+  });
+
+  pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
+    const details = message.details as any;
+    if (!details) return undefined;
+
+    return {
+      render(width: number): string[] {
+        const name = details.name ?? "subagent";
+        const exitCode = details.exitCode ?? 0;
+        const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
+        const bgFn = exitCode === 0
+          ? (text: string) => theme.bg("toolSuccessBg", text)
+          : (text: string) => theme.bg("toolErrorBg", text);
+        const icon = exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+        const status = exitCode === 0 ? "completed" : `failed (exit ${exitCode})`;
+        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+
+        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "—")} ${status} ${theme.fg("dim", `(${elapsed})`)}`;
+        const rawContent = typeof message.content === "string" ? message.content : "";
+
+        const summary = rawContent
+          .replace(/\n\nSession: .+\nResume: .+$/, "")
+          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
+          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "");
+
+        const contentLines = [header];
+
+        if (options.expanded) {
+          if (summary) {
+            for (const line of summary.split("\n")) {
+              contentLines.push(line.slice(0, width - 6));
+            }
+          }
+          if (details.sessionFile) {
+            contentLines.push("");
+            contentLines.push(theme.fg("dim", `Session: ${details.sessionFile}`));
+            contentLines.push(theme.fg("dim", `Resume:  pi --session ${details.sessionFile}`));
+          }
+        } else {
+          if (summary) {
+            const previewLines = summary.split("\n").slice(0, 5);
+            for (const line of previewLines) {
+              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
+            }
+            const totalLines = summary.split("\n").length;
+            if (totalLines > 5) {
+              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
+            }
+          }
+          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+        }
+
+        const box = new Box(1, 1, bgFn);
+        box.addChild(new Text(contentLines.join("\n"), 0, 0));
+        return ["", ...box.render(width)];
+      },
+    };
   });
 
   // /plan command — start the full planning workflow
